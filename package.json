@@ -1,0 +1,10 @@
+{
+  "name": "factory-gemini-shim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local OpenAI-compatible proxy that rewrites Factory BYOK Gemini requests to Gemini native REST.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

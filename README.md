@@ -29,8 +29,8 @@ The main issue is that Factory's generic OpenAI-compatible BYOK path does not pr
 
 - `server.js`: the proxy
 - `package.json`: minimal package metadata
-- `start-proxy.cmd`: Windows launcher
-- `start-proxy.sh`: macOS/Linux launcher
+- `start-proxy.cmd`: Windows launcher with auto-restart
+- `start-proxy.sh`: macOS/Linux launcher with auto-restart
 
 ## Factory settings.json
 
@@ -88,6 +88,8 @@ set GEMINI_API_KEY=your-gemini-key
 start-proxy.cmd
 ```
 
+The launcher automatically restarts the proxy if Node exits unexpectedly. Close the window or press `Ctrl+C` to stop it intentionally.
+
 Health check:
 
 ```powershell
@@ -113,6 +115,8 @@ chmod +x start-proxy.sh
 ./start-proxy.sh
 ```
 
+The launcher automatically restarts the proxy if Node exits unexpectedly. Press `Ctrl+C` to stop it intentionally.
+
 Health check:
 
 ```bash
@@ -126,7 +130,7 @@ Windows:
 ```powershell
 cd C:\path\to\factory-gemini-shim
 $env:GEMINI_API_KEY = "your-gemini-key"
-Start-Process node -ArgumentList "server.js" -WorkingDirectory (Get-Location)
+Start-Process cmd -ArgumentList "/c start-proxy.cmd" -WorkingDirectory (Get-Location)
 ```
 
 macOS/Linux:
@@ -134,8 +138,11 @@ macOS/Linux:
 ```bash
 cd /path/to/factory-gemini-shim
 export GEMINI_API_KEY="your-gemini-key"
-nohup node server.js > proxy.out.log 2> proxy.err.log &
+nohup ./start-proxy.sh > proxy.out.log 2> proxy.err.log &
 ```
+
+Optional:
+- Set `RESTART_DELAY_SECONDS` to control how long the launcher waits before restarting. Default: `2`
 
 ## Recommended startup order
 

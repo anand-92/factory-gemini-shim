@@ -2,6 +2,10 @@ import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 4310);
+const HOST = process.env.HOST || "127.0.0.1";
+const REQUEST_BODY_LIMIT_BYTES = Number(process.env.REQUEST_BODY_LIMIT_BYTES || 10 * 1024 * 1024);
+const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 60000);
+const TOOL_CALL_CACHE_LIMIT = Number(process.env.TOOL_CALL_CACHE_LIMIT || 500);
 const GEMINI_API_KEY =
   process.env.GEMINI_API_KEY ||
   process.env.GOOGLE_API_KEY ||
@@ -12,7 +16,19 @@ const OPENAI_MODELS_PATH = "https://generativelanguage.googleapis.com/v1beta/ope
 const GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const toolCallCache = new Map();
 
+function log(level, message, details) {
+  const timestamp = new Date().toISOString();
+  if (details === undefined) {
+    console[level](`[${timestamp}] ${message}`);
+    return;
+  }
+  console[level](`[${timestamp}] ${message}`, details);
+}
+
 function json(response, statusCode, payload, extraHeaders = {}) {
+  if (response.writableEnded) {
+    return;
+  }
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
@@ -58,16 +74,45 @@ function sha(input) {
 function readJsonBody(request) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    request.on("data", (chunk) => chunks.push(chunk));
-    request.on("end", () => {
+    let size = 0;
+    let settled = false;
+
+    const finish = (callback, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      request.removeListener("data", onData);
+      request.removeListener("end", onEnd);
+      request.removeListener("error", onError);
+      request.removeListener("aborted", onAborted);
+      callback(value);
+    };
+
+    const onError = (error) => finish(reject, error);
+    const onAborted = () => finish(reject, new Error("Client closed the request before the body was fully sent."));
+    const onData = (chunk) => {
+      size += chunk.length;
+      if (size > REQUEST_BODY_LIMIT_BYTES) {
+        finish(reject, new Error(`Request body exceeds ${REQUEST_BODY_LIMIT_BYTES} bytes.`));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
       try {
         const raw = Buffer.concat(chunks).toString("utf8");
-        resolve(raw ? JSON.parse(raw) : {});
+        finish(resolve, raw ? JSON.parse(raw) : {});
       } catch (error) {
-        reject(error);
+        finish(reject, error);
       }
-    });
-    request.on("error", reject);
+    };
+
+    request.on("data", onData);
+    request.on("end", onEnd);
+    request.on("error", onError);
+    request.on("aborted", onAborted);
   });
 }
 
@@ -234,6 +279,7 @@ function buildAssistantParts(message) {
     };
     const thoughtSignature = toolCall?.extra_content?.google?.thought_signature;
     if (thoughtSignature) {
+      // Gemini REST JSON uses camelCase `thoughtSignature` on the Part.
       part.thoughtSignature = thoughtSignature;
     }
     functionCallParts.push(part);
@@ -415,12 +461,19 @@ function geminiPartsToOpenAiMessage(model, response) {
           arguments: argsString,
         },
       });
-      if (part.thoughtSignature) {
+      const thoughtSignature = part.thoughtSignature || part.thought_signature;
+      if (thoughtSignature) {
         toolCalls[toolCalls.length - 1].extra_content = {
           google: {
-            thought_signature: part.thoughtSignature,
+            thought_signature: thoughtSignature,
           },
         };
+      }
+      if (toolCallCache.size >= TOOL_CALL_CACHE_LIMIT) {
+        const oldestKey = toolCallCache.keys().next().value;
+        if (oldestKey) {
+          toolCallCache.delete(oldestKey);
+        }
       }
       toolCallCache.set(toolCallId, {
         cacheKey,
@@ -482,7 +535,9 @@ function toOpenAiCompletion(model, requestBody, geminiResponse) {
 }
 
 function writeSseChunk(response, payload) {
-  response.write(`data: ${JSON.stringify(payload)}\n\n`);
+  if (!response.writableEnded) {
+    response.write(`data: ${JSON.stringify(payload)}\n\n`);
+  }
 }
 
 function toOpenAiStream(response, completion) {
@@ -534,7 +589,7 @@ function toOpenAiStream(response, completion) {
 
 async function fetchGeminiNative(model, apiKey, body) {
   const url = `${GEMINI_NATIVE_BASE}/${encodeURIComponent(normalizeModel(model))}:generateContent`;
-  const response = await fetch(url, {
+  const response = await fetchUpstream(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -542,12 +597,52 @@ async function fetchGeminiNative(model, apiKey, body) {
     },
     body: JSON.stringify(body),
   });
+  return parseJsonResponse(response);
+}
 
+async function fetchUpstream(url, options = {}) {
+  let signal = options.signal;
+  if (!signal && typeof AbortSignal?.timeout === "function") {
+    signal = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
+  }
+
+  try {
+    return await fetch(url, {
+      ...options,
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+      throw new Error(`Upstream request timed out after ${UPSTREAM_TIMEOUT_MS}ms.`);
+    }
+    throw error;
+  }
+}
+
+async function relayUpstreamResponse(response, upstream) {
+  const text = await upstream.text();
+  if (response.writableEnded) {
+    return;
+  }
+  response.writeHead(upstream.status, {
+    "Content-Type": upstream.headers.get("content-type") || "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  });
+  response.end(text);
+}
+
+async function parseJsonResponse(response) {
   const text = await response.text();
   if (!response.ok) {
     throw new Error(text || `${response.status} ${response.statusText}`);
   }
-  return JSON.parse(text);
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error("Upstream returned invalid JSON.");
+  }
 }
 
 async function proxyModels(request, response) {
@@ -557,19 +652,12 @@ async function proxyModels(request, response) {
     return;
   }
 
-  const upstream = await fetch(OPENAI_MODELS_PATH, {
+  const upstream = await fetchUpstream(OPENAI_MODELS_PATH, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
     },
   });
-  const text = await upstream.text();
-  response.writeHead(upstream.status, {
-    "Content-Type": upstream.headers.get("content-type") || "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  });
-  response.end(text);
+  await relayUpstreamResponse(response, upstream);
 }
 
 async function proxyModelRetrieve(request, response, pathname) {
@@ -579,19 +667,12 @@ async function proxyModelRetrieve(request, response, pathname) {
     return;
   }
 
-  const upstream = await fetch(`https://generativelanguage.googleapis.com/v1beta/openai${pathname}`, {
+  const upstream = await fetchUpstream(`https://generativelanguage.googleapis.com/v1beta/openai${pathname}`, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
     },
   });
-  const text = await upstream.text();
-  response.writeHead(upstream.status, {
-    "Content-Type": upstream.headers.get("content-type") || "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  });
-  response.end(text);
+  await relayUpstreamResponse(response, upstream);
 }
 
 async function handleChatCompletions(request, response) {
@@ -604,8 +685,15 @@ async function handleChatCompletions(request, response) {
   let body;
   try {
     body = await readJsonBody(request);
-  } catch {
-    sendError(response, 400, "Invalid JSON request body.");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid JSON request body.";
+    const statusCode =
+      typeof message === "string" && message.startsWith("Request body exceeds")
+        ? 413
+        : message === "Client closed the request before the body was fully sent."
+          ? 499
+          : 400;
+    sendError(response, statusCode, message);
     return;
   }
 
@@ -630,7 +718,7 @@ async function handleChatCompletions(request, response) {
   }
 }
 
-const server = http.createServer(async (request, response) => {
+async function handleRequest(request, response) {
   if (!request.url) {
     sendError(response, 404, "Not found.");
     return;
@@ -672,8 +760,49 @@ const server = http.createServer(async (request, response) => {
   }
 
   sendError(response, 404, `No route for ${request.method} ${url.pathname}.`, "not_found_error");
+}
+
+const server = http.createServer((request, response) => {
+  response.on("error", (error) => {
+    log("error", "Response stream error.", error);
+  });
+
+  handleRequest(request, response).catch((error) => {
+    log("error", `Unhandled request error for ${request.method || "UNKNOWN"} ${request.url || ""}.`, error);
+    if (!response.writableEnded) {
+      sendError(response, 500, error instanceof Error ? error.message : "Internal server error.");
+    }
+  });
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`factory-gemini-shim listening on http://127.0.0.1:${PORT}`);
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.requestTimeout = 120000;
+
+server.on("clientError", (error, socket) => {
+  log("warn", "Client connection error.", error.message);
+  if (socket.writable) {
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+  }
+});
+
+process.on("uncaughtException", (error) => {
+  log("error", "Uncaught exception.", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  log("error", "Unhandled promise rejection.", reason);
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    log("log", `Received ${signal}, shutting down.`);
+    server.close(() => {
+      process.exit(0);
+    });
+  });
+}
+
+server.listen(PORT, HOST, () => {
+  log("log", `factory-gemini-shim listening on http://${HOST}:${PORT}`);
 });
